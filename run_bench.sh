@@ -1,0 +1,1 @@
+go test -race -bench=. -benchmem -cpuprofile cpu.prof -memprofile mem.prof
