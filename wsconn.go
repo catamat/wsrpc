@@ -18,7 +18,9 @@ type WSConn interface {
 
 // WebSocketConn adapts a WSConn to a net.Conn.
 type WebSocketConn struct {
-	ws WSConn
+	ws          WSConn
+	readBuf     []byte
+	readMsgType int
 }
 
 // NewWebSocketConn creates a new WebSocketConn from a WSConn.
@@ -26,24 +28,65 @@ func NewWebSocketConn(ws WSConn) net.Conn {
 	return &WebSocketConn{ws: ws}
 }
 
-func (c *WebSocketConn) Read(b []byte) (n int, err error) {
+func (c *WebSocketConn) Read(p []byte) (n int, err error) {
+	if len(c.readBuf) > 0 {
+		n = copy(p, c.readBuf)
+		c.readBuf = c.readBuf[n:]
+
+		if len(c.readBuf) == 0 {
+			c.readBuf = nil
+		}
+
+		return n, nil
+	}
+
+	var message []byte
+
 	for {
-		_, message, err := c.ws.ReadMessage()
+		msgType, msg, err := c.ws.ReadMessage()
 		if err != nil {
 			return 0, err
 		}
-		if len(message) > 0 {
-			return copy(b, message), nil
+
+		if msgType == 2 { // BinaryMessage
+			message = msg
+			c.readMsgType = msgType
+			break
 		}
 	}
+
+	n = copy(p, message)
+	if n < len(message) {
+		c.readBuf = message[n:]
+	}
+
+	return n, nil
 }
 
 func (c *WebSocketConn) Write(b []byte) (n int, err error) {
-	err = c.ws.WriteMessage(2, b) // 2 = BinaryMessage
-	if err != nil {
-		return 0, err
+	const maxMessageSize = 8192
+
+	totalWritten := 0
+	remaining := len(b)
+
+	for remaining > 0 {
+		chunkSize := remaining
+		if chunkSize > maxMessageSize {
+			chunkSize = maxMessageSize
+		}
+
+		chunk := b[totalWritten : totalWritten+chunkSize]
+
+		err = c.ws.WriteMessage(2, chunk) // BinaryMessage
+		if err != nil {
+			return totalWritten, err
+		}
+
+		totalWritten += chunkSize
+		remaining -= chunkSize
 	}
-	return len(b), nil
+
+	return totalWritten, nil
 }
 
 func (c *WebSocketConn) Close() error {
