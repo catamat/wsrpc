@@ -28,6 +28,7 @@ func NewWebSocketConn(ws WSConn) net.Conn {
 	return &WebSocketConn{ws: ws}
 }
 
+// Read reads data from the WebSocket connection.
 func (c *WebSocketConn) Read(p []byte) (n int, err error) {
 	if len(c.readBuf) > 0 {
 		n = copy(p, c.readBuf)
@@ -63,6 +64,7 @@ func (c *WebSocketConn) Read(p []byte) (n int, err error) {
 	return n, nil
 }
 
+// Write writes data to the WebSocket connection.
 func (c *WebSocketConn) Write(b []byte) (n int, err error) {
 	const maxMessageSize = 8192
 
@@ -89,18 +91,22 @@ func (c *WebSocketConn) Write(b []byte) (n int, err error) {
 	return totalWritten, nil
 }
 
+// Close closes the WebSocket connection.
 func (c *WebSocketConn) Close() error {
 	return c.ws.Close()
 }
 
+// LocalAddr returns the local network address.
 func (c *WebSocketConn) LocalAddr() net.Addr {
 	return c.ws.LocalAddr()
 }
 
+// RemoteAddr returns the remote network address.
 func (c *WebSocketConn) RemoteAddr() net.Addr {
 	return c.ws.RemoteAddr()
 }
 
+// SetDeadline sets the read and write deadlines for the WebSocket connection.
 func (c *WebSocketConn) SetDeadline(t time.Time) error {
 	if err := c.ws.SetReadDeadline(t); err != nil {
 		return err
@@ -108,10 +114,12 @@ func (c *WebSocketConn) SetDeadline(t time.Time) error {
 	return c.ws.SetWriteDeadline(t)
 }
 
+// SetReadDeadline sets the read deadline for the WebSocket connection.
 func (c *WebSocketConn) SetReadDeadline(t time.Time) error {
 	return c.ws.SetReadDeadline(t)
 }
 
+// SetWriteDeadline sets the write deadline for the WebSocket connection.
 func (c *WebSocketConn) SetWriteDeadline(t time.Time) error {
 	return c.ws.SetWriteDeadline(t)
 }
