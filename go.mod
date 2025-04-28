@@ -10,7 +10,6 @@ require (
 	github.com/gofiber/fiber/v2 v2.52.5
 	github.com/gorilla/websocket v1.5.3
 	github.com/hashicorp/yamux v0.1.2
-	golang.org/x/exp v0.0.0-20241009180824-f66d83c29e7c
 )
 
 require go.uber.org/goleak v1.3.0

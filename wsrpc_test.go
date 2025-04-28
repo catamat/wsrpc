@@ -1,231 +1,446 @@
 package wsrpc
 
 import (
-	"net/http"
-	"net/http/httptest"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/rpc"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"go.uber.org/goleak"
-	"golang.org/x/exp/rand"
 )
 
-// Definition of the service for testing.
-type TestService struct{}
+type pipeConn struct {
+	net.Conn
+	readMu  sync.Mutex
+	writeMu sync.Mutex
+	readBuf []byte
+}
 
-// Arguments and reply for the Add method.
-type Args struct {
+func newPipeConn(conn net.Conn) *pipeConn {
+	return &pipeConn{Conn: conn}
+}
+
+// ReadMessage reads a message from the pipe connection.
+func (p *pipeConn) ReadMessage() (messageType int, data []byte, err error) {
+	p.readMu.Lock()
+	defer p.readMu.Unlock()
+
+	// Check internal buffer first
+	if len(p.readBuf) > 0 {
+		data = p.readBuf
+		p.readBuf = nil
+
+		return BinaryMessage, data, nil
+	}
+
+	// Read from underlying connection
+	buf := make([]byte, 1024) // A small buffer just for reading I/O
+	n, err := p.Conn.Read(buf)
+	if err != nil {
+		return -1, nil, err // Propagate errors like io.EOF
+	}
+
+	if n == 0 {
+		return BinaryMessage, []byte{}, nil
+	}
+
+	data = make([]byte, n)
+	copy(data, buf[:n])
+
+	return BinaryMessage, data, nil
+}
+
+// WriteMessage writes a message to the pipe connection.
+func (p *pipeConn) WriteMessage(messageType int, data []byte) error {
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+
+	if messageType != BinaryMessage {
+		return fmt.Errorf("pipeConn mock only supports BinaryMessage, got %d", messageType)
+	}
+
+	n, err := p.Conn.Write(data)
+	if err != nil {
+		return fmt.Errorf("failed to write message payload: %w", err)
+	}
+	if n != len(data) {
+		return fmt.Errorf("incomplete payload write (%d/%d bytes)", n, len(data))
+	}
+
+	return err
+}
+
+func (p *pipeConn) Close() error {
+	return p.Conn.Close()
+}
+
+func (p *pipeConn) LocalAddr() net.Addr {
+	return p.Conn.LocalAddr()
+}
+
+func (p *pipeConn) RemoteAddr() net.Addr {
+	return p.Conn.RemoteAddr()
+}
+
+func (p *pipeConn) SetReadDeadline(t time.Time) error {
+	return p.Conn.SetReadDeadline(t)
+}
+
+func (p *pipeConn) SetWriteDeadline(t time.Time) error {
+	return p.Conn.SetWriteDeadline(t)
+}
+
+var _ Conn = (*pipeConn)(nil)
+
+// --- RPC Functions ---
+
+type Calculator struct{}
+
+type AddArgs struct {
 	A, B int
 }
 
-type Reply struct {
+type AddReply struct {
 	Sum int
 }
 
-// Add method to sum two numbers.
-func (s *TestService) Add(args *Args, reply *Reply) error {
+func (c *Calculator) Add(args *AddArgs, reply *AddReply) error {
 	reply.Sum = args.A + args.B
 	return nil
 }
 
-func TestWSRPC(t *testing.T) {
-	defer goleak.VerifyNone(t)
+// --- Helpers Functions ---
 
-	var upgrader = websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool {
-			return true
-		},
+func setupTestPeers(t *testing.T) (client *WSRPC, server *WSRPC, clientConn *pipeConn, serverConn *pipeConn) {
+	t.Helper()
+
+	srvPipe, cliPipe := net.Pipe()
+	serverConn = newPipeConn(srvPipe)
+	clientConn = newPipeConn(cliPipe)
+
+	config := DefaultConfig()
+	config.LogOutput = io.Discard
+
+	config.KeepAliveInterval = 1 * time.Second
+	config.ConnectionWriteTimeout = 5 * time.Second
+	config.StreamOpenTimeout = 5 * time.Second
+	config.StreamCloseTimeout = 5 * time.Second
+
+	type result struct {
+		peer *WSRPC
+		err  error
 	}
 
-	// Create the test server
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Check if the path matches "/ws"
-		if r.URL.Path != "/ws" {
-			http.NotFound(w, r)
-			return
+	serverChan := make(chan result, 1)
+	clientChan := make(chan result, 1)
+
+	go func() {
+		srvConfig := *config
+		srv, err := NewServer(serverConn, &srvConfig)
+		serverChan <- result{peer: srv, err: err}
+	}()
+
+	go func() {
+		cliConfig := *config
+		cli, err := NewClient(clientConn, &cliConfig)
+		clientChan <- result{peer: cli, err: err}
+	}()
+
+	serverResult := <-serverChan
+	clientResult := <-clientChan
+
+	if serverResult.err != nil {
+		if clientResult.peer != nil {
+			clientResult.peer.Close()
 		}
 
-		// Upgrade the HTTP connection to a WebSocket connection
-		wsConn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			t.Fatalf("Error upgrading connection to WebSocket: %v", err)
-		}
-		defer wsConn.Close()
+		serverConn.Close()
+		clientConn.Close()
+		t.Fatalf("Failed to create WSRPC Server: %v", serverResult.err)
+	}
 
-		// Create server connection
-		serverConn := NewWebSocketConn(wsConn)
-
-		// Create the WSRPC server
-		wsrpcServer, err := NewServer(serverConn)
-		if err != nil {
-			t.Fatalf("Error creating server: %v", err)
-		}
-		defer wsrpcServer.Close()
-
-		// Register the service on the server for calls from the client
-		err = wsrpcServer.Register(&TestService{})
-		if err != nil {
-			t.Fatalf("Error registering service on server: %v", err)
+	if clientResult.err != nil {
+		if serverResult.peer != nil {
+			serverResult.peer.Close()
 		}
 
-		// Server calls the Add method on the client
-		args2 := &Args{A: 10, B: 15}
-		reply2 := &Reply{}
-		err = wsrpcServer.Call("TestService.Add", args2, reply2)
-		if err != nil {
-			t.Fatalf("Error in RPC call from server to client: %v", err)
-		}
+		serverConn.Close()
+		clientConn.Close()
+		t.Fatalf("Failed to create WSRPC Client: %v", clientResult.err)
+	}
 
-		if reply2.Sum != 25 {
-			t.Errorf("Expected result 25, got %d", reply2.Sum)
-		}
+	server = serverResult.peer
+	client = clientResult.peer
 
-		// Wait until the connection is closed
-		<-wsrpcServer.Done()
-	}))
+	calcService := new(Calculator)
+
+	if err := server.Register(calcService); err != nil {
+		server.Close()
+		client.Close()
+		serverConn.Close()
+		clientConn.Close()
+		t.Fatalf("Failed to register service on server: %v", err)
+	}
+
+	if err := client.Register(calcService); err != nil {
+		server.Close()
+		client.Close()
+		serverConn.Close()
+		clientConn.Close()
+		t.Fatalf("Failed to register service on client: %v", err)
+	}
+
+	return client, server, clientConn, serverConn
+}
+
+// --- Test Cases ---
+
+// TestWSRPC_BasicRPC checks the basic RPC functionality of the WSRPC package.
+func TestWSRPC_BasicRPC(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	client, server, clientConn, serverConn := setupTestPeers(t)
+	defer client.Close()
 	defer server.Close()
+	defer clientConn.Close()
+	defer serverConn.Close()
 
-	// Convert the server's URL to a WebSocket URL and append "/ws"
-	wsURL := "ws" + server.URL[len("http"):] + "/ws"
+	// Client -> Server test
+	args := &AddArgs{A: 5, B: 3}
+	var reply AddReply
 
-	// Create the client
-	wsConn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
-	if err != nil {
-		t.Fatalf("Error connecting to server: %v", err)
-	}
-	defer wsConn.Close()
+	callTimeout := 5 * time.Second
+	errChan := make(chan error, 1)
 
-	// Create client connection
-	clientConn := NewWebSocketConn(wsConn)
+	go func() {
+		errChan <- client.Call("Calculator.Add", args, &reply)
+	}()
 
-	// Create the WSRPC client
-	wsrpcClient, err := NewClient(clientConn)
-	if err != nil {
-		t.Fatalf("Error creating client: %v", err)
-	}
-	defer wsrpcClient.Close()
+	select {
+	case err := <-errChan:
+		if err != nil {
+			t.Errorf("Client -> Server RPC call failed: %v", err)
+		}
 
-	// Register the service on the client for calls from the server
-	err = wsrpcClient.Register(&TestService{})
-	if err != nil {
-		t.Fatalf("Error registering service on client: %v", err)
-	}
-
-	// Client calls the Add method on the server
-	args := &Args{A: 5, B: 7}
-	reply := &Reply{}
-	err = wsrpcClient.Call("TestService.Add", args, reply)
-	if err != nil {
-		t.Fatalf("Error in RPC call: %v", err)
+		if reply.Sum != 8 {
+			t.Errorf("Client -> Server RPC call expected sum %d, got %d", 8, reply.Sum)
+		}
+	case <-time.After(callTimeout):
+		t.Fatalf("Client -> Server RPC call timed out after %v", callTimeout)
 	}
 
-	if reply.Sum != 12 {
-		t.Errorf("Expected result 12, got %d", reply.Sum)
+	// Server -> Client test
+	args = &AddArgs{A: 10, B: 20}
+	reply = AddReply{}
+
+	go func() {
+		errChan <- server.Call("Calculator.Add", args, &reply)
+	}()
+
+	select {
+	case err := <-errChan:
+		if err != nil {
+			t.Errorf("Server -> Client RPC call failed: %v", err)
+		}
+
+		if reply.Sum != 30 {
+			t.Errorf("Server -> Client RPC call expected sum %d, got %d", 30, reply.Sum)
+		}
+	case <-time.After(callTimeout):
+		t.Fatalf("Server -> Client RPC call timed out after %v", callTimeout)
 	}
 }
 
-func BenchmarkWSRPC(b *testing.B) {
-	defer goleak.VerifyNone(b)
+// TestWSRPC_Close checks that closing one peer terminates the other.
+func TestWSRPC_Close(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 
-	// Number of clients to simulate.
-	numClients := 100
+	client, server, clientConn, serverConn := setupTestPeers(t)
+	defer clientConn.Close()
+	defer serverConn.Close()
 
-	var upgrader = websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool {
-			return true
-		},
+	closeTimeout := 5 * time.Second
+
+	err := client.Close()
+	if err != nil {
+		t.Fatalf("client.Close() failed: %v", err)
 	}
 
-	// Create the test server with a WebSocket handler.
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Upgrade the HTTP connection to a WebSocket connection.
-		wsConn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
+	select {
+	case <-client.Done():
+		// OK
+	case <-time.After(1 * time.Second):
+		t.Errorf("client.Done() did not close after client.Close()")
+	}
 
-		// Create server connection.
-		serverConn := NewWebSocketConn(wsConn)
+	select {
+	case <-server.Done():
+		// OK
+	case <-time.After(closeTimeout):
+		t.Fatalf("server.Done() did not close after client closed connection within %v", closeTimeout)
+	}
 
-		// Create the WSRPC server.
-		wsrpcServer, err := NewServer(serverConn)
-		if err != nil {
-			return
-		}
+	err = client.Close()
+	if err != nil {
+		t.Errorf("Second client.Close() should not return error, got: %v", err)
+	}
 
-		// Register the service on the server for calls from the client.
-		err = wsrpcServer.Register(&TestService{})
-		if err != nil {
-			return
-		}
+	err = server.Close()
+	if err != nil {
+		log.Printf("server.Close() returned (potentially expected) error: %v", err)
+	}
 
-		// Wait until the connection is closed.
-		<-wsrpcServer.Done()
-	}))
+	select {
+	case <-server.Done():
+		// OK
+	case <-time.After(1 * time.Second):
+		t.Errorf("server.Done() did not close within 1s after server.Close()")
+	}
+}
+
+// TestWSRPC_CallAfterClose checks that calls fail after closing.
+func TestWSRPC_CallAfterClose(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	client, server, clientConn, serverConn := setupTestPeers(t)
 	defer server.Close()
+	defer clientConn.Close()
+	defer serverConn.Close()
 
-	// Convert the server's URL to a WebSocket URL and append "/ws".
-	wsURL := "ws" + server.URL[len("http"):] + "/ws"
+	client.Close()
 
-	// Start the clients.
-	clients := make([]*WSRPC, numClients)
-	for i := 0; i < numClients; i++ {
-		// Create the client.
-		wsConn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
-		if err != nil {
-			b.Fatalf("Error connecting to server: %v", err)
-		}
-
-		// Create client connection.
-		clientConn := NewWebSocketConn(wsConn)
-
-		// Create the WSRPC client.
-		wsrpcClient, err := NewClient(clientConn)
-		if err != nil {
-			b.Fatalf("Error creating client: %v", err)
-		}
-
-		// Register the service on the client for calls from the server.
-		err = wsrpcClient.Register(&TestService{})
-		if err != nil {
-			b.Fatalf("Error registering service on client: %v", err)
-		}
-
-		clients[i] = wsrpcClient
+	select {
+	case <-client.Done():
+		// OK
+	case <-time.After(1 * time.Second):
+		t.Fatal("client.Done() did not close after client.Close()")
 	}
 
-	// Ensure all clients are closed after the benchmark.
-	defer func() {
-		for _, client := range clients {
-			client.Close()
+	time.Sleep(100 * time.Millisecond)
+
+	// Client -> Server test
+	args := &AddArgs{A: 1, B: 1}
+	var reply AddReply
+
+	err := client.Call("Calculator.Add", args, &reply)
+	if err == nil {
+		t.Errorf("Expected error when calling RPC on closed client, got nil")
+	} else {
+		t.Logf("Got expected error calling on closed client: %v", err)
+
+		if !errors.Is(err, rpc.ErrShutdown) && err.Error() != "rpc: client is closed" {
+			t.Logf("Warning: Received error '%v', which might not be the canonical closed error", err)
 		}
-	}()
+	}
 
-	// Prepare arguments.
-	args := &Args{A: 5, B: 7}
+	// Server -> Client test (after client close)
+	err = server.Call("Calculator.Add", args, &reply)
+	if err == nil {
+		t.Errorf("Expected error when calling RPC on server with closed underlying connection, got nil")
+	} else {
+		t.Logf("Got expected error calling on server with closed connection: %v", err)
+	}
+}
 
-	// Reset the timer to exclude setup time from the benchmark.
-	b.ResetTimer()
-	b.ReportAllocs()
+func TestWSRPC_Concurrency(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
 
-	b.RunParallel(func(pb *testing.PB) {
-		// Use a thread-local random source to select clients.
-		rnd := rand.New(rand.NewSource(uint64(time.Now().UnixNano())))
-		reply := &Reply{}
+	client, server, clientConn, serverConn := setupTestPeers(t)
+	defer client.Close()
+	defer server.Close()
+	defer clientConn.Close()
+	defer serverConn.Close()
 
-		for pb.Next() {
-			client := clients[rnd.Intn(numClients)]
+	numConcurrent := 50
+	callTimeout := 8 * time.Second
+	var wg sync.WaitGroup
+	errChan := make(chan error, numConcurrent*2)
 
-			err := client.Call("TestService.Add", args, reply)
-			if err != nil {
-				b.Error(err)
-				return
+	// Client -> Server test
+	t.Logf("Starting %d concurrent Client -> Server calls", numConcurrent)
+	wg.Add(numConcurrent)
+	for i := 0; i < numConcurrent; i++ {
+		go func(callIdx int) {
+			defer wg.Done()
+			args := &AddArgs{A: callIdx, B: 1}
+			var reply AddReply
+			callDone := make(chan error, 1)
+
+			go func() {
+				callDone <- client.Call("Calculator.Add", args, &reply)
+			}()
+
+			select {
+			case err := <-callDone:
+				if err != nil {
+					errChan <- fmt.Errorf("[C->S Call %d] RPC failed: %w", callIdx, err)
+					return
+				}
+
+				expected := callIdx + 1
+
+				if reply.Sum != expected {
+					errChan <- fmt.Errorf("[C->S Call %d] Expected sum %d, got %d", callIdx, expected, reply.Sum)
+				}
+			case <-time.After(callTimeout):
+				errChan <- fmt.Errorf("[C->S Call %d] RPC timed out after %v", callIdx, callTimeout)
 			}
-			if reply.Sum != 12 {
-				b.Errorf("Expected result 12, got %d", reply.Sum)
-				return
+		}(i)
+	}
+
+	wg.Wait()
+	t.Logf("Finished concurrent Client -> Server calls")
+
+	// Server -> Client test
+	t.Logf("Starting %d concurrent Server -> Client calls", numConcurrent)
+	wg.Add(numConcurrent)
+	for i := 0; i < numConcurrent; i++ {
+		go func(callIdx int) {
+			defer wg.Done()
+			args := &AddArgs{A: callIdx * 2, B: 5}
+			var reply AddReply
+			callDone := make(chan error, 1)
+
+			go func() {
+				callDone <- server.Call("Calculator.Add", args, &reply)
+			}()
+
+			select {
+			case err := <-callDone:
+				if err != nil {
+					errChan <- fmt.Errorf("[S->C Call %d] RPC failed: %w", callIdx, err)
+					return
+				}
+
+				expected := (callIdx * 2) + 5
+
+				if reply.Sum != expected {
+					errChan <- fmt.Errorf("[S->C Call %d] Expected sum %d, got %d", callIdx, expected, reply.Sum)
+				}
+			case <-time.After(callTimeout):
+				errChan <- fmt.Errorf("[S->C Call %d] RPC timed out after %v", callIdx, callTimeout)
 			}
-		}
-	})
+		}(i)
+	}
+
+	wg.Wait()
+	t.Logf("Finished concurrent Server -> Client calls")
+
+	close(errChan)
+	errorCount := 0
+	for err := range errChan {
+		t.Error(err) // Report each error found
+		errorCount++
+	}
+
+	if errorCount > 0 {
+		t.Errorf("Concurrency test finished with %d errors", errorCount)
+	} else {
+		t.Log("Concurrency test finished successfully with no errors.")
+	}
 }

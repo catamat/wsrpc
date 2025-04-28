@@ -2,13 +2,17 @@ package wsrpc
 
 import (
 	"errors"
+	"fmt"
 	"io"
-	"net"
 	"net/rpc"
+	"os"
 	"sync"
+	"time"
 
 	"github.com/hashicorp/yamux"
 )
+
+const defaultMaxWebSocketChunkSize = 8192
 
 // WSRPC defines a bidirectional RPC connection over a Yamux session.
 type WSRPC struct {
@@ -17,19 +21,58 @@ type WSRPC struct {
 	rpcServer *rpc.Server
 	rpcClient *rpc.Client
 	closeChan chan struct{}
+	logOutput io.Writer
+}
+
+// Config defines the configuration options.
+type Config struct {
+	AcceptBacklog          int
+	EnableKeepAlive        bool
+	KeepAliveInterval      time.Duration
+	ConnectionWriteTimeout time.Duration
+	MaxStreamWindowSize    uint32
+	StreamOpenTimeout      time.Duration
+	StreamCloseTimeout     time.Duration
+	LogOutput              io.Writer
+	MaxWebSocketChunkSize  int
+}
+
+// DefaultConfig is used to return a default configuration
+func DefaultConfig() *Config {
+	return &Config{
+		AcceptBacklog:          256,
+		EnableKeepAlive:        true,
+		KeepAliveInterval:      30 * time.Second,
+		ConnectionWriteTimeout: 10 * time.Second,
+		MaxStreamWindowSize:    256 * 1024,
+		StreamCloseTimeout:     5 * time.Minute,
+		StreamOpenTimeout:      75 * time.Second,
+		LogOutput:              os.Stderr,
+		MaxWebSocketChunkSize:  defaultMaxWebSocketChunkSize,
+	}
 }
 
 // NewServer creates a new server on a net.Conn connection.
-func NewServer(conn net.Conn) (*WSRPC, error) {
-	yamuxConfig := yamux.DefaultConfig()
-	yamuxConfig.LogOutput = io.Discard
+func NewServer(conn Conn, config *Config) (*WSRPC, error) {
+	wsConn := newWSConn(conn, config.MaxWebSocketChunkSize)
 
-	session, err := yamux.Server(conn, yamuxConfig)
+	yamuxConfig := &yamux.Config{
+		AcceptBacklog:          config.AcceptBacklog,
+		EnableKeepAlive:        config.EnableKeepAlive,
+		KeepAliveInterval:      config.KeepAliveInterval,
+		ConnectionWriteTimeout: config.ConnectionWriteTimeout,
+		MaxStreamWindowSize:    config.MaxStreamWindowSize,
+		StreamCloseTimeout:     config.StreamCloseTimeout,
+		StreamOpenTimeout:      config.StreamOpenTimeout,
+		LogOutput:              config.LogOutput,
+	}
+
+	session, err := yamux.Server(wsConn, yamuxConfig)
 	if err != nil {
 		return nil, err
 	}
 
-	wsrpc, err := createPeer(session)
+	wsrpc, err := createPeer(session, config.LogOutput)
 	if err != nil {
 		session.Close()
 		return nil, err
@@ -39,16 +82,26 @@ func NewServer(conn net.Conn) (*WSRPC, error) {
 }
 
 // NewClient creates a new client on a net.Conn connection.
-func NewClient(conn net.Conn) (*WSRPC, error) {
-	yamuxConfig := yamux.DefaultConfig()
-	yamuxConfig.LogOutput = io.Discard
+func NewClient(conn Conn, config *Config) (*WSRPC, error) {
+	wsConn := newWSConn(conn, config.MaxWebSocketChunkSize)
 
-	session, err := yamux.Client(conn, yamuxConfig)
+	yamuxConfig := &yamux.Config{
+		AcceptBacklog:          config.AcceptBacklog,
+		EnableKeepAlive:        config.EnableKeepAlive,
+		KeepAliveInterval:      config.KeepAliveInterval,
+		ConnectionWriteTimeout: config.ConnectionWriteTimeout,
+		MaxStreamWindowSize:    config.MaxStreamWindowSize,
+		StreamCloseTimeout:     config.StreamCloseTimeout,
+		StreamOpenTimeout:      config.StreamOpenTimeout,
+		LogOutput:              config.LogOutput,
+	}
+
+	session, err := yamux.Client(wsConn, yamuxConfig)
 	if err != nil {
 		return nil, err
 	}
 
-	wsrpc, err := createPeer(session)
+	wsrpc, err := createPeer(session, config.LogOutput)
 	if err != nil {
 		session.Close()
 		return nil, err
@@ -58,11 +111,12 @@ func NewClient(conn net.Conn) (*WSRPC, error) {
 }
 
 // createPeer creates a new RPC peer.
-func createPeer(session *yamux.Session) (*WSRPC, error) {
+func createPeer(session *yamux.Session, logOutput io.Writer) (*WSRPC, error) {
 	wsrpc := &WSRPC{
 		session:   session,
 		rpcServer: rpc.NewServer(),
 		closeChan: make(chan struct{}),
+		logOutput: logOutput,
 	}
 
 	// Start accepting incoming streams for the RPC service
@@ -89,13 +143,17 @@ func (wsrpc *WSRPC) acceptStreams() {
 			case <-wsrpc.closeChan:
 				return
 			default:
+				if wsrpc.logOutput != io.Discard && wsrpc.logOutput != nil {
+					fmt.Fprintf(wsrpc.logOutput, "error accepting yamux stream: %v. closing session.\n", err)
+				}
+
+				wsrpc.Close()
+				return
 			}
 
-			wsrpc.Close()
-			return
 		}
 
-		wsrpc.rpcServer.ServeConn(stream)
+		go wsrpc.rpcServer.ServeConn(stream)
 	}
 }
 

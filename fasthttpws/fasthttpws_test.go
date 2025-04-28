@@ -51,11 +51,11 @@ func TestFastHTTPWS(t *testing.T) {
 		}
 		defer wsConn.Close()
 
-		// Create server connection
-		serverConn := wsrpc.NewWebSocketConn(wsConn)
+		// Initialize the server configuration
+		config := wsrpc.DefaultConfig()
 
 		// Create the WSRPC server
-		wsrpcServer, err := wsrpc.NewServer(serverConn)
+		wsrpcServer, err := wsrpc.NewServer(wsConn, config)
 		if err != nil {
 			t.Fatalf("Error creating server: %v", err)
 		}
@@ -98,13 +98,13 @@ func TestFastHTTPWS(t *testing.T) {
 	defer wsConn.Close()
 
 	// Wrap the WebSocket connection using fasthttpws.Conn
-	wsAdapter := &Conn{Conn: wsConn}
+	wsConnF := NewAdapter(wsConn)
 
-	// Create client connection
-	clientConn := wsrpc.NewWebSocketConn(wsAdapter)
+	// Initialize the client configuration
+	config := wsrpc.DefaultConfig()
 
 	// Create the WSRPC client
-	wsrpcClient, err := wsrpc.NewClient(clientConn)
+	wsrpcClient, err := wsrpc.NewClient(wsConnF, config)
 	if err != nil {
 		t.Fatalf("Error creating client: %v", err)
 	}

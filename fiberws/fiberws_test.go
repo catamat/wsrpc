@@ -40,13 +40,13 @@ func TestFiberWS(t *testing.T) {
 		defer c.Close()
 
 		// Wrap the WebSocket connection using fiberws.Conn
-		wsConn := &Conn{Conn: c}
+		wsConnF := NewAdapter(c)
 
-		// Create server connection
-		serverConn := wsrpc.NewWebSocketConn(wsConn)
+		// Initialize the server configuration
+		config := wsrpc.DefaultConfig()
 
 		// Create the WSRPC server
-		wsrpcServer, err := wsrpc.NewServer(serverConn)
+		wsrpcServer, err := wsrpc.NewServer(wsConnF, config)
 		if err != nil {
 			t.Errorf("Error creating WSRPC server: %v", err)
 			return
@@ -114,11 +114,11 @@ func TestFiberWS(t *testing.T) {
 	}
 	defer wsConn.Close()
 
-	// Create client connection
-	clientConn := wsrpc.NewWebSocketConn(wsConn)
+	// Initialize the client configuration
+	config := wsrpc.DefaultConfig()
 
 	// Create the WSRPC client
-	wsrpcClient, err := wsrpc.NewClient(clientConn)
+	wsrpcClient, err := wsrpc.NewClient(wsConn, config)
 	if err != nil {
 		t.Fatalf("Error creating client: %v", err)
 	}

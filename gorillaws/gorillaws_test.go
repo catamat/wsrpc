@@ -50,11 +50,14 @@ func TestGorillaWS(t *testing.T) {
 		}
 		defer wsConn.Close()
 
-		// Create server connection
-		serverConn := wsrpc.NewWebSocketConn(wsConn)
+		// Wrap the WebSocket connection using gorillaws.Conn
+		wsConnG := NewAdapter(wsConn)
+
+		// Initialize the server configuration
+		config := wsrpc.DefaultConfig()
 
 		// Create the WSRPC server
-		wsrpcServer, err := wsrpc.NewServer(serverConn)
+		wsrpcServer, err := wsrpc.NewServer(wsConnG, config)
 		if err != nil {
 			t.Fatalf("Error creating server: %v", err)
 		}
@@ -96,14 +99,11 @@ func TestGorillaWS(t *testing.T) {
 	}
 	defer wsConn.Close()
 
-	// Wrap the WebSocket connection using gorillaws.Conn
-	wsAdapter := &Conn{Conn: wsConn}
-
-	// Create client connection
-	clientConn := wsrpc.NewWebSocketConn(wsAdapter)
+	// Initialize the client configuration
+	config := wsrpc.DefaultConfig()
 
 	// Create the WSRPC client
-	wsrpcClient, err := wsrpc.NewClient(clientConn)
+	wsrpcClient, err := wsrpc.NewClient(wsConn, config)
 	if err != nil {
 		t.Fatalf("Error creating client: %v", err)
 	}
