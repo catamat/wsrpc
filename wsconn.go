@@ -80,7 +80,7 @@ func (c *wsConn) Read(b []byte) (n int, err error) {
 func (c *wsConn) Write(b []byte) (n int, err error) {
 	// Manually fragments data into chunks (maxMessageSize) to ensure
 	// consistent behavior across different WebSocket libraries and to limit
-	// memory usage for large writes, especially on slower networks.
+	// memory usage for large writes, especially on slower networks
 	maxMessageSize := c.maxChunkSize
 
 	totalWritten := 0

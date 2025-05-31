@@ -37,7 +37,7 @@ type Config struct {
 	MaxWebSocketChunkSize  int
 }
 
-// DefaultConfig is used to return a default configuration
+// DefaultConfig is used to return a default configuration.
 func DefaultConfig() *Config {
 	return &Config{
 		AcceptBacklog:          256,
