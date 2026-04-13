@@ -19,6 +19,7 @@ go get github.com/catamat/wsrpc@latest
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -91,6 +92,15 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	openCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	err = wsrpcServer.Open(openCtx)
+	if err != nil {
+		log.Printf("Error opening server peer: %v\n", err)
+		return
+	}
+
 	// --- Server calls Client ---
 
 	// 1. Hello
@@ -149,6 +159,7 @@ func main() {
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -222,6 +233,15 @@ func main() {
 			return
 		}
 
+		openCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		err = wsrpcServer.Open(openCtx)
+		if err != nil {
+			log.Printf("Error opening server peer: %v\n", err)
+			return
+		}
+
 		// --- Server calls Client ---
 
 		// 1. Hello
@@ -277,6 +297,7 @@ func main() {
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -356,6 +377,15 @@ func connect() error {
 		return err
 	}
 
+	openCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	err = wsrpcClient.Open(openCtx)
+	if err != nil {
+		log.Printf("Error opening client peer: %v\n", err)
+		return err
+	}
+
 	// --- Client calls Server ---
 
 	// 1. Hello
@@ -409,6 +439,7 @@ func connect() error {
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -485,6 +516,15 @@ func connect() error {
 	err = wsrpcClient.Register(&ClientAPI{})
 	if err != nil {
 		log.Printf("Error registering service on client: %v\n", err)
+		return err
+	}
+
+	openCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	err = wsrpcClient.Open(openCtx)
+	if err != nil {
+		log.Printf("Error opening client peer: %v\n", err)
 		return err
 	}
 

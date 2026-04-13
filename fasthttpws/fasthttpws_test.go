@@ -1,14 +1,16 @@
 package fasthttpws
 
 import (
-	"net/http"
-	"net/http/httptest"
+	"context"
+	"errors"
+	"fmt"
+	"net"
 	"testing"
 	"time"
 
 	"github.com/catamat/wsrpc"
 	fwebsocket "github.com/fasthttp/websocket"
-	gwebsocket "github.com/gorilla/websocket"
+	"github.com/valyala/fasthttp"
 )
 
 // Definition of the service for testing.
@@ -30,93 +32,131 @@ func (s *TestService) Add(args *Args, reply *Reply) error {
 }
 
 func TestFastHTTPWS(t *testing.T) {
-	var upgrader = gwebsocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool {
+	serverErrCh := make(chan error, 1)
+	listenerErrCh := make(chan error, 1)
+	serverReady := make(chan struct{})
+
+	reportServerErr := func(err error) {
+		select {
+		case serverErrCh <- err:
+		default:
+		}
+	}
+
+	var upgrader = fwebsocket.FastHTTPUpgrader{
+		CheckOrigin: func(ctx *fasthttp.RequestCtx) bool {
 			return true
 		},
 	}
 
-	// Create the test server
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Check if the path matches "/ws"
-		if r.URL.Path != "/ws" {
-			http.NotFound(w, r)
-			return
+	server := &fasthttp.Server{
+		Handler: func(ctx *fasthttp.RequestCtx) {
+			if string(ctx.Path()) != "/ws" {
+				ctx.Error("not found", fasthttp.StatusNotFound)
+				return
+			}
+
+			err := upgrader.Upgrade(ctx, func(wsConn *fwebsocket.Conn) {
+				defer wsConn.Close()
+
+				config := wsrpc.DefaultConfig()
+
+				wsrpcServer, err := wsrpc.NewServer(NewAdapter(wsConn), config)
+				if err != nil {
+					reportServerErr(fmt.Errorf("error creating server: %w", err))
+					return
+				}
+				defer wsrpcServer.Close()
+
+				err = wsrpcServer.Register(&TestService{})
+				if err != nil {
+					reportServerErr(fmt.Errorf("error registering service on server: %w", err))
+					return
+				}
+
+				openCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+
+				err = wsrpcServer.Open(openCtx)
+				if err != nil {
+					reportServerErr(fmt.Errorf("error opening server peer: %w", err))
+					return
+				}
+
+				args2 := &Args{A: 10, B: 15}
+				reply2 := &Reply{}
+				err = wsrpcServer.Call("TestService.Add", args2, reply2)
+				if err != nil {
+					reportServerErr(fmt.Errorf("error in RPC call from server to client: %w", err))
+					return
+				}
+
+				if reply2.Sum != 25 {
+					reportServerErr(fmt.Errorf("expected result 25, got %d", reply2.Sum))
+					return
+				}
+
+				reportServerErr(nil)
+
+				<-wsrpcServer.Done()
+			})
+			if err != nil {
+				reportServerErr(fmt.Errorf("error upgrading connection to WebSocket: %w", err))
+			}
+		},
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Error creating listener: %v", err)
+	}
+	defer listener.Close()
+
+	go func() {
+		close(serverReady)
+		if err := server.Serve(listener); err != nil && !errors.Is(err, net.ErrClosed) {
+			select {
+			case listenerErrCh <- err:
+			default:
+			}
 		}
+	}()
 
-		// Upgrade the HTTP connection to a WebSocket connection
-		wsConn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			t.Fatalf("Error upgrading connection to WebSocket: %v", err)
-		}
-		defer wsConn.Close()
+	<-serverReady
 
-		// Initialize the server configuration
-		config := wsrpc.DefaultConfig()
-
-		// Create the WSRPC server
-		wsrpcServer, err := wsrpc.NewServer(wsConn, config)
-		if err != nil {
-			t.Fatalf("Error creating server: %v", err)
-		}
-		defer wsrpcServer.Close()
-
-		// Register the service on the server for calls from the client
-		err = wsrpcServer.Register(&TestService{})
-		if err != nil {
-			t.Fatalf("Error registering service on server: %v", err)
-		}
-
-		// Server calls the Add method on the client
-		args2 := &Args{A: 10, B: 15}
-		reply2 := &Reply{}
-		err = wsrpcServer.Call("TestService.Add", args2, reply2)
-		if err != nil {
-			t.Fatalf("Error in RPC call from server to client: %v", err)
-		}
-
-		if reply2.Sum != 25 {
-			t.Errorf("Expected result 25, got %d", reply2.Sum)
-		}
-
-		// Wait until the connection is closed
-		<-wsrpcServer.Done()
-	}))
-	defer server.Close()
-
-	// Give the server some time to start
 	time.Sleep(100 * time.Millisecond)
 
-	// Convert the server's URL to a WebSocket URL and append "/ws"
-	wsURL := "ws" + server.URL[len("http"):] + "/ws"
+	wsURL := "ws://" + listener.Addr().String() + "/ws"
 
-	// Create the client
 	wsConn, _, err := fwebsocket.DefaultDialer.Dial(wsURL, nil)
 	if err != nil {
 		t.Fatalf("Error connecting to server: %v", err)
 	}
 	defer wsConn.Close()
 
-	// Wrap the WebSocket connection using fasthttpws.Conn
 	wsConnF := NewAdapter(wsConn)
 
-	// Initialize the client configuration
 	config := wsrpc.DefaultConfig()
 
-	// Create the WSRPC client
 	wsrpcClient, err := wsrpc.NewClient(wsConnF, config)
 	if err != nil {
 		t.Fatalf("Error creating client: %v", err)
 	}
 	defer wsrpcClient.Close()
 
-	// Register the service on the client for calls from the server
 	err = wsrpcClient.Register(&TestService{})
 	if err != nil {
 		t.Fatalf("Error registering service on client: %v", err)
 	}
 
-	// Client calls the Add method on the server
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err = wsrpcClient.Open(ctx)
+	if err != nil {
+		t.Fatalf("Error opening client peer: %v", err)
+	}
+
 	args := &Args{A: 5, B: 7}
 	reply := &Reply{}
 	err = wsrpcClient.Call("TestService.Add", args, reply)
@@ -126,5 +166,20 @@ func TestFastHTTPWS(t *testing.T) {
 
 	if reply.Sum != 12 {
 		t.Errorf("Expected result 12, got %d", reply.Sum)
+	}
+
+	select {
+	case err := <-serverErrCh:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for server-side RPC")
+	}
+
+	select {
+	case err := <-listenerErrCh:
+		t.Fatalf("FastHTTP server failed: %v", err)
+	default:
 	}
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -77,6 +78,15 @@ func connect() error {
 	err = wsrpcClient.Register(&ClientAPI{})
 	if err != nil {
 		log.Printf("Error registering service on client: %v\n", err)
+		return err
+	}
+
+	openCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	err = wsrpcClient.Open(openCtx)
+	if err != nil {
+		log.Printf("Error opening client peer: %v\n", err)
 		return err
 	}
 

@@ -1,6 +1,8 @@
 package fiberws
 
 import (
+	"context"
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -30,6 +32,16 @@ func (s *TestService) Add(args *Args, reply *Reply) error {
 }
 
 func TestFiberWS(t *testing.T) {
+	serverErrCh := make(chan error, 1)
+	listenerErrCh := make(chan error, 1)
+
+	reportServerErr := func(err error) {
+		select {
+		case serverErrCh <- err:
+		default:
+		}
+	}
+
 	// Create the test server
 	app := fiber.New(fiber.Config{
 		DisableStartupMessage: true,
@@ -48,7 +60,7 @@ func TestFiberWS(t *testing.T) {
 		// Create the WSRPC server
 		wsrpcServer, err := wsrpc.NewServer(wsConnF, config)
 		if err != nil {
-			t.Errorf("Error creating WSRPC server: %v", err)
+			reportServerErr(fmt.Errorf("error creating WSRPC server: %w", err))
 			return
 		}
 		defer wsrpcServer.Close()
@@ -56,7 +68,16 @@ func TestFiberWS(t *testing.T) {
 		// Register the service on the server for calls from the client
 		err = wsrpcServer.Register(&TestService{})
 		if err != nil {
-			t.Errorf("Error registering service on server: %v", err)
+			reportServerErr(fmt.Errorf("error registering service on server: %w", err))
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		err = wsrpcServer.Open(ctx)
+		if err != nil {
+			reportServerErr(fmt.Errorf("error opening server peer: %w", err))
 			return
 		}
 
@@ -65,13 +86,16 @@ func TestFiberWS(t *testing.T) {
 		reply2 := &Reply{}
 		err = wsrpcServer.Call("TestService.Add", args2, reply2)
 		if err != nil {
-			t.Errorf("Error in RPC call from server to client: %v", err)
+			reportServerErr(fmt.Errorf("error in RPC call from server to client: %w", err))
 			return
 		}
 
 		if reply2.Sum != 25 {
-			t.Errorf("Expected result 25, got %d", reply2.Sum)
+			reportServerErr(fmt.Errorf("expected result 25, got %d", reply2.Sum))
+			return
 		}
+
+		reportServerErr(nil)
 
 		// Wait until the connection is closed
 		<-wsrpcServer.Done()
@@ -94,7 +118,10 @@ func TestFiberWS(t *testing.T) {
 
 		// Start the server
 		if err := app.Listener(listener); err != nil {
-			t.Errorf("Error starting Fiber server: %v", err)
+			select {
+			case listenerErrCh <- err:
+			default:
+			}
 		}
 	}()
 
@@ -130,6 +157,14 @@ func TestFiberWS(t *testing.T) {
 		t.Fatalf("Error registering service on client: %v", err)
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err = wsrpcClient.Open(ctx)
+	if err != nil {
+		t.Fatalf("Error opening client peer: %v", err)
+	}
+
 	// Client calls the Add method on the server
 	args := &Args{A: 5, B: 7}
 	reply := &Reply{}
@@ -140,5 +175,20 @@ func TestFiberWS(t *testing.T) {
 
 	if reply.Sum != 12 {
 		t.Errorf("Expected result 12, got %d", reply.Sum)
+	}
+
+	select {
+	case err := <-serverErrCh:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for server-side RPC")
+	}
+
+	select {
+	case err := <-listenerErrCh:
+		t.Fatalf("Fiber server failed: %v", err)
+	default:
 	}
 }

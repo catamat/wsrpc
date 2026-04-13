@@ -1,12 +1,12 @@
 package wsrpc
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
-	"net/rpc"
 	"sync"
 	"testing"
 	"time"
@@ -198,6 +198,35 @@ func setupTestPeers(t *testing.T) (client *WSRPC, server *WSRPC, clientConn *pip
 	return client, server, clientConn, serverConn
 }
 
+func openTestPeers(t *testing.T, client *WSRPC, server *WSRPC) {
+	t.Helper()
+
+	type result struct {
+		name string
+		err  error
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	resultCh := make(chan result, 2)
+
+	go func() {
+		resultCh <- result{name: "client", err: client.Open(ctx)}
+	}()
+
+	go func() {
+		resultCh <- result{name: "server", err: server.Open(ctx)}
+	}()
+
+	for i := 0; i < 2; i++ {
+		result := <-resultCh
+		if result.err != nil {
+			t.Fatalf("%s.Open() failed: %v", result.name, result.err)
+		}
+	}
+}
+
 // --- Test Cases ---
 
 // TestWSRPC_BasicRPC checks the basic RPC functionality of the WSRPC package.
@@ -209,6 +238,8 @@ func TestWSRPC_BasicRPC(t *testing.T) {
 	defer server.Close()
 	defer clientConn.Close()
 	defer serverConn.Close()
+
+	openTestPeers(t, client, server)
 
 	// Client -> Server test
 	args := &AddArgs{A: 5, B: 3}
@@ -312,6 +343,8 @@ func TestWSRPC_CallAfterClose(t *testing.T) {
 	defer clientConn.Close()
 	defer serverConn.Close()
 
+	openTestPeers(t, client, server)
+
 	client.Close()
 
 	select {
@@ -332,9 +365,8 @@ func TestWSRPC_CallAfterClose(t *testing.T) {
 		t.Errorf("Expected error when calling RPC on closed client, got nil")
 	} else {
 		t.Logf("Got expected error calling on closed client: %v", err)
-
-		if !errors.Is(err, rpc.ErrShutdown) && err.Error() != "rpc: client is closed" {
-			t.Logf("Warning: Received error '%v', which might not be the canonical closed error", err)
+		if !errors.Is(err, ErrClosed) {
+			t.Logf("Warning: received error %q instead of ErrClosed", err)
 		}
 	}
 
@@ -355,6 +387,8 @@ func TestWSRPC_Concurrency(t *testing.T) {
 	defer server.Close()
 	defer clientConn.Close()
 	defer serverConn.Close()
+
+	openTestPeers(t, client, server)
 
 	numConcurrent := 50
 	callTimeout := 8 * time.Second
@@ -442,5 +476,133 @@ func TestWSRPC_Concurrency(t *testing.T) {
 		t.Errorf("Concurrency test finished with %d errors", errorCount)
 	} else {
 		t.Log("Concurrency test finished successfully with no errors.")
+	}
+}
+
+func TestWSRPC_NilConfigUsesDefaults(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	srvPipe, cliPipe := net.Pipe()
+	serverConn := newPipeConn(srvPipe)
+	clientConn := newPipeConn(cliPipe)
+	defer serverConn.Close()
+	defer clientConn.Close()
+
+	type result struct {
+		peer *WSRPC
+		err  error
+	}
+
+	serverChan := make(chan result, 1)
+	clientChan := make(chan result, 1)
+
+	go func() {
+		srv, err := NewServer(serverConn, nil)
+		serverChan <- result{peer: srv, err: err}
+	}()
+
+	go func() {
+		cli, err := NewClient(clientConn, nil)
+		clientChan <- result{peer: cli, err: err}
+	}()
+
+	serverResult := <-serverChan
+	clientResult := <-clientChan
+
+	if serverResult.err != nil {
+		if clientResult.peer != nil {
+			clientResult.peer.Close()
+		}
+		t.Fatalf("NewServer(nil config) failed: %v", serverResult.err)
+	}
+
+	if clientResult.err != nil {
+		if serverResult.peer != nil {
+			serverResult.peer.Close()
+		}
+		t.Fatalf("NewClient(nil config) failed: %v", clientResult.err)
+	}
+
+	server := serverResult.peer
+	client := clientResult.peer
+	defer server.Close()
+	defer client.Close()
+
+	calcService := new(Calculator)
+
+	if err := server.Register(calcService); err != nil {
+		t.Fatalf("Failed to register service on server: %v", err)
+	}
+
+	if err := client.Register(calcService); err != nil {
+		t.Fatalf("Failed to register service on client: %v", err)
+	}
+
+	openTestPeers(t, client, server)
+
+	args := &AddArgs{A: 2, B: 3}
+	var reply AddReply
+
+	if err := client.Call("Calculator.Add", args, &reply); err != nil {
+		t.Fatalf("RPC call with defaulted nil config failed: %v", err)
+	}
+
+	if reply.Sum != 5 {
+		t.Fatalf("Expected sum %d, got %d", 5, reply.Sum)
+	}
+}
+
+func TestWSRPC_CallBeforeOpenFails(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	client, server, clientConn, serverConn := setupTestPeers(t)
+	defer client.Close()
+	defer server.Close()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	args := &AddArgs{A: 1, B: 2}
+	var reply AddReply
+
+	err := client.Call("Calculator.Add", args, &reply)
+	if !errors.Is(err, ErrNotOpen) {
+		t.Fatalf("Expected ErrNotOpen before Open, got %v", err)
+	}
+}
+
+func TestWSRPC_RegisterAfterOpenFails(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	client, server, clientConn, serverConn := setupTestPeers(t)
+	defer client.Close()
+	defer server.Close()
+	defer clientConn.Close()
+	defer serverConn.Close()
+
+	openErrCh := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		openErrCh <- client.Open(ctx)
+	}()
+
+	select {
+	case <-client.readyChan:
+	case <-time.After(1 * time.Second):
+		t.Fatal("client did not enter opening state")
+	}
+
+	if err := client.Register(&Calculator{}); !errors.Is(err, ErrAlreadyOpen) {
+		t.Fatalf("Expected ErrAlreadyOpen after Open started, got %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := server.Open(ctx); err != nil {
+		t.Fatalf("server.Open() failed: %v", err)
+	}
+
+	if err := <-openErrCh; err != nil {
+		t.Fatalf("client.Open() failed: %v", err)
 	}
 }

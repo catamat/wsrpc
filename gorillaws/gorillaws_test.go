@@ -1,6 +1,8 @@
 package gorillaws
 
 import (
+	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -29,6 +31,15 @@ func (s *TestService) Add(args *Args, reply *Reply) error {
 }
 
 func TestGorillaWS(t *testing.T) {
+	serverErrCh := make(chan error, 1)
+
+	reportServerErr := func(err error) {
+		select {
+		case serverErrCh <- err:
+		default:
+		}
+	}
+
 	var upgrader = gwebsocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
 			return true
@@ -46,7 +57,8 @@ func TestGorillaWS(t *testing.T) {
 		// Upgrade the HTTP connection to a WebSocket connection
 		wsConn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
-			t.Fatalf("Error upgrading connection to WebSocket: %v", err)
+			reportServerErr(fmt.Errorf("error upgrading connection to WebSocket: %w", err))
+			return
 		}
 		defer wsConn.Close()
 
@@ -59,14 +71,25 @@ func TestGorillaWS(t *testing.T) {
 		// Create the WSRPC server
 		wsrpcServer, err := wsrpc.NewServer(wsConnG, config)
 		if err != nil {
-			t.Fatalf("Error creating server: %v", err)
+			reportServerErr(fmt.Errorf("error creating server: %w", err))
+			return
 		}
 		defer wsrpcServer.Close()
 
 		// Register the service on the server for calls from the client
 		err = wsrpcServer.Register(&TestService{})
 		if err != nil {
-			t.Fatalf("Error registering service on server: %v", err)
+			reportServerErr(fmt.Errorf("error registering service on server: %w", err))
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		err = wsrpcServer.Open(ctx)
+		if err != nil {
+			reportServerErr(fmt.Errorf("error opening server peer: %w", err))
+			return
 		}
 
 		// Server calls the Add method on the client
@@ -74,12 +97,16 @@ func TestGorillaWS(t *testing.T) {
 		reply2 := &Reply{}
 		err = wsrpcServer.Call("TestService.Add", args2, reply2)
 		if err != nil {
-			t.Fatalf("Error in RPC call from server to client: %v", err)
+			reportServerErr(fmt.Errorf("error in RPC call from server to client: %w", err))
+			return
 		}
 
 		if reply2.Sum != 25 {
-			t.Errorf("Expected result 25, got %d", reply2.Sum)
+			reportServerErr(fmt.Errorf("expected result 25, got %d", reply2.Sum))
+			return
 		}
+
+		reportServerErr(nil)
 
 		// Wait until the connection is closed
 		<-wsrpcServer.Done()
@@ -115,6 +142,14 @@ func TestGorillaWS(t *testing.T) {
 		t.Fatalf("Error registering service on client: %v", err)
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err = wsrpcClient.Open(ctx)
+	if err != nil {
+		t.Fatalf("Error opening client peer: %v", err)
+	}
+
 	// Client calls the Add method on the server
 	args := &Args{A: 5, B: 7}
 	reply := &Reply{}
@@ -125,5 +160,14 @@ func TestGorillaWS(t *testing.T) {
 
 	if reply.Sum != 12 {
 		t.Errorf("Expected result 12, got %d", reply.Sum)
+	}
+
+	select {
+	case err := <-serverErrCh:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for server-side RPC")
 	}
 }
