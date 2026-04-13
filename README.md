@@ -1,6 +1,5 @@
 # WSRPC
 [![License](https://img.shields.io/github/license/mashape/apistatus.svg)](https://github.com/catamat/wsrpc/blob/master/LICENSE)
-[![Build Status](https://travis-ci.org/catamat/wsrpc.svg?branch=master)](https://travis-ci.org/catamat/wsrpc)
 [![Go Report Card](https://goreportcard.com/badge/github.com/catamat/wsrpc)](https://goreportcard.com/report/github.com/catamat/wsrpc)
 [![Go Reference](https://pkg.go.dev/badge/github.com/catamat/wsrpc.svg)](https://pkg.go.dev/github.com/catamat/wsrpc)
 [![Version](https://img.shields.io/github/tag/catamat/wsrpc.svg?color=blue&label=version)](https://github.com/catamat/wsrpc/releases)
