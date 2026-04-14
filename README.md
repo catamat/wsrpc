@@ -4,7 +4,7 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/catamat/wsrpc.svg)](https://pkg.go.dev/github.com/catamat/wsrpc)
 [![Version](https://img.shields.io/github/tag/catamat/wsrpc.svg?color=blue&label=version)](https://github.com/catamat/wsrpc/releases)
 
-WSRPC is simple package to allow bidirectional RPC over a WebSocket connection.\
+WSRPC is package to allow bidirectional RPC over a WebSocket connection.\
 The library already provides WebSocket adapters for Gorilla, Fiber, and FastHTTP; for all other cases, it should be quite easy to implement the `Conn` interface.
 
 ## Installation:
