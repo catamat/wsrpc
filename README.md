@@ -9,7 +9,7 @@ The library already provides WebSocket adapters for Gorilla, Fiber, and FastHTTP
 
 ## Installation:
 ```
-go get github.com/catamat/wsrpc@latest
+go install github.com/catamat/wsrpc@latest
 ```
 ## Examples:
 
